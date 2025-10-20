@@ -16,7 +16,6 @@ import (
 	"github.com/gofiber/fiber/v2"
 	"github.com/gofiber/fiber/v2/middleware/compress"
 	"github.com/gofiber/fiber/v2/middleware/cors"
-	"github.com/gofiber/fiber/v2/middleware/limiter"
 	"github.com/gofiber/fiber/v2/middleware/logger"
 	"github.com/gofiber/fiber/v2/middleware/recover"
 	"github.com/joho/godotenv"
@@ -988,16 +987,6 @@ func main() {
 		AllowCredentials: false,
 		ExposeHeaders:    "*",
 		MaxAge:           86400,
-	}))
-
-	fiberApp.Use(limiter.New(limiter.Config{
-		Max:        100,
-		Expiration: 1 * time.Minute,
-		LimitReached: func(c *fiber.Ctx) error {
-			return c.Status(fiber.StatusTooManyRequests).JSON(fiber.Map{
-				"error": "rate limit exceeded",
-			})
-		},
 	}))
 
 	fiberApp.Get("/", app.indexHandler)
