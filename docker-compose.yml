@@ -1,0 +1,39 @@
+version: '3.8'
+
+services:
+  hifi-api:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      - CLIENT_ID=${CLIENT_ID}
+      - CLIENT_ID_HIRES=${CLIENT_ID_HIRES}
+      - CLIENT_SECRET=${CLIENT_SECRET}
+      - CLIENT_SECRET_HIRES=${CLIENT_SECRET_HIRES}
+      - TIDAL_REFRESH=${TIDAL_REFRESH}
+      - TIDAL_REFRESH_HIRES=${TIDAL_REFRESH_HIRES}
+      - REDIS_URL=redis
+      - REDIS_PORT=6379
+      - USER_ID=${USER_ID}
+      - PORT=8000
+    depends_on:
+      - redis
+    restart: unless-stopped
+    networks:
+      - hifi-network
+
+  redis:
+    image: redis:7-alpine
+    command: redis-server --maxmemory 256mb --maxmemory-policy allkeys-lru
+    volumes:
+      - redis_data:/data
+    restart: unless-stopped
+    networks:
+      - hifi-network
+
+volumes:
+  redis_data:
+
+networks:
+  hifi-network:
+    driver: bridge

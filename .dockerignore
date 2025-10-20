@@ -1,0 +1,14 @@
+.git
+.gitignore
+.env
+*.md
+LICENSE
+*.log
+.DS_Store
+tmp/
+vendor/
+*.swp
+*.swo
+*~
+.vscode/
+.idea/
