@@ -952,20 +952,19 @@ func main() {
 	defer app.redisClient.Close()
 
 	fiberApp := fiber.New(fiber.Config{
-		Prefork:                false,
-		CaseSensitive:          true,
-		StrictRouting:          false,
-		ServerHeader:           "HiFi-Go",
-		AppName:                "HiFi-RestAPI v2.0",
-		BodyLimit:              50 * 1024 * 1024,
-		ReadTimeout:            30 * time.Second,
-		WriteTimeout:           30 * time.Second,
-		IdleTimeout:            120 * time.Second,
-		DisableStartupMessage:  false,
-		EnablePrintRoutes:      false,
-		JSONEncoder:            fastJSON.Marshal,
-		JSONDecoder:            fastJSON.Unmarshal,
-		CompressedFileSuffixes: map[string]string{"br": ".br", "gzip": ".gz"},
+		Prefork:               false,
+		CaseSensitive:         true,
+		StrictRouting:         false,
+		ServerHeader:          "HiFi-Go",
+		AppName:               "HiFi-RestAPI v2.0",
+		BodyLimit:             50 * 1024 * 1024,
+		ReadTimeout:           30 * time.Second,
+		WriteTimeout:          30 * time.Second,
+		IdleTimeout:           120 * time.Second,
+		DisableStartupMessage: false,
+		EnablePrintRoutes:     false,
+		JSONEncoder:           fastJSON.Marshal,
+		JSONDecoder:           fastJSON.Unmarshal,
 	})
 
 	fiberApp.Use(recover.New(recover.Config{
