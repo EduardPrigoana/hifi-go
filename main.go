@@ -243,7 +243,8 @@ func (a *App) makeRequest(reqURL, token string) ([]byte, int, error) {
 		return nil, 0, err
 	}
 
-	return resp.BodyCopy(nil), resp.StatusCode(), nil
+	body := append([]byte(nil), resp.Body()...)
+	return body, resp.StatusCode(), nil
 }
 
 func (a *App) makeRequestWithHeader(reqURL string, headers map[string]string) ([]byte, int, error) {
@@ -259,7 +260,8 @@ func (a *App) makeRequestWithHeader(reqURL string, headers map[string]string) ([
 		return nil, 0, err
 	}
 
-	return resp.BodyCopy(nil), resp.StatusCode(), nil
+	body := append([]byte(nil), resp.Body()...)
+	return body, resp.StatusCode(), nil
 }
 
 type playbackInfoManifest struct {
