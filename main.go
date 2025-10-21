@@ -34,23 +34,10 @@ const (
 	maxIdleConnDuration = 90 * time.Second
 	maxResponseBodySize = 100 * 1024 * 1024
 	redisPoolSize       = 50
-	defaultLimit        = 25
-	maxLimit            = 100
-	defaultOffset       = 0
 )
 
 type Config struct {
-	ClientID          string
-	ClientIDHires     string
-	ClientSecret      string
-	ClientSecretHires string
-	RefreshToken      string
-	RefreshTokenHires string
-	RedisURL          string
-	RedisPort         string
-	RedisPassword     string
-	UserID            string
-	Port              string
+	ClientID, ClientIDHires, ClientSecret, ClientSecretHires, RefreshToken, RefreshTokenHires, RedisURL, RedisPort, RedisPassword, UserID, Port string
 }
 
 type TokenCache struct {
@@ -67,21 +54,6 @@ type TokenResponse struct {
 	RefreshToken string `json:"refresh_token,omitempty"`
 }
 
-type PaginationParams struct {
-	Limit  int
-	Offset int
-}
-
-type PaginatedResponse struct {
-	Data       interface{} `json:"data"`
-	Pagination struct {
-		Limit   int  `json:"limit"`
-		Offset  int  `json:"offset"`
-		Total   int  `json:"total,omitempty"`
-		HasMore bool `json:"hasMore,omitempty"`
-	} `json:"pagination"`
-}
-
 type App struct {
 	config        *Config
 	redisClient   *redis.Client
@@ -90,14 +62,12 @@ type App struct {
 	tokenCacheHR  *TokenCache
 	refreshLock   sync.Mutex
 	refreshLockHR sync.Mutex
-	startTime     time.Time
 }
 
 var ctx = context.Background()
 
 func loadConfig() *Config {
 	_ = godotenv.Load()
-
 	return &Config{
 		ClientID:          os.Getenv("CLIENT_ID"),
 		ClientIDHires:     os.Getenv("CLIENT_ID_HIRES"),
@@ -122,80 +92,45 @@ func getEnv(key, defaultValue string) string {
 
 func newApp() *App {
 	config := loadConfig()
-
 	redisClient := redis.NewClient(&redis.Options{
-		Addr:            fmt.Sprintf("%s:%s", config.RedisURL, config.RedisPort),
-		Password:        config.RedisPassword,
-		DB:              0,
-		PoolSize:        redisPoolSize,
-		MinIdleConns:    10,
-		MaxRetries:      3,
-		DialTimeout:     5 * time.Second,
-		ReadTimeout:     3 * time.Second,
-		WriteTimeout:    3 * time.Second,
-		PoolTimeout:     4 * time.Second,
-		ConnMaxIdleTime: 5 * time.Minute,
+		Addr: config.RedisURL + ":" + config.RedisPort, Password: config.RedisPassword, DB: 0, PoolSize: redisPoolSize, MinIdleConns: 10,
 	})
 
 	pingCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-	defer cancel()
-
 	if err := redisClient.Ping(pingCtx).Err(); err != nil {
-		log.Printf("Redis connection failed: %v (continuing without Redis cache)", err)
+		log.Printf("Redis connection failed: %v", err)
 	} else {
 		log.Println("Redis connected successfully")
 	}
+	cancel()
 
 	httpClient := &fasthttp.Client{
-		MaxConnsPerHost:               maxConnsPerHost,
-		MaxIdleConnDuration:           maxIdleConnDuration,
-		MaxConnDuration:               time.Hour,
-		ReadTimeout:                   requestTimeout,
-		WriteTimeout:                  requestTimeout,
-		MaxResponseBodySize:           maxResponseBodySize,
-		DisableHeaderNamesNormalizing: true,
-		DisablePathNormalizing:        true,
-		ReadBufferSize:                8192,
-		WriteBufferSize:               8192,
-		NoDefaultUserAgentHeader:      false,
+		MaxConnsPerHost: maxConnsPerHost, MaxIdleConnDuration: maxIdleConnDuration, ReadTimeout: requestTimeout, WriteTimeout: requestTimeout, MaxResponseBodySize: maxResponseBodySize,
 	}
-
 	app := &App{
-		config:      config,
-		redisClient: redisClient,
-		httpClient:  httpClient,
-		tokenCache: &TokenCache{
-			LastCheck: time.Time{},
-		},
-		tokenCacheHR: &TokenCache{
-			LastCheck: time.Time{},
-		},
-		startTime: time.Now(),
+		config:       config,
+		redisClient:  redisClient,
+		httpClient:   httpClient,
+		tokenCache:   &TokenCache{},
+		tokenCacheHR: &TokenCache{},
 	}
 
 	go func() {
-		log.Println("Pre-warming tokens...")
 		if _, err := app.getToken(false); err != nil {
 			log.Printf("Failed to pre-warm standard token: %v", err)
 		}
 		if _, err := app.getToken(true); err != nil {
 			log.Printf("Failed to pre-warm HiRes token: %v", err)
 		}
-		log.Println("Token pre-warming complete")
 	}()
 
 	return app
 }
 
 func (a *App) getToken(hiRes bool) (string, error) {
-	cache := a.tokenCache
-	lock := &a.refreshLock
-	cacheKey := "access_token"
-
+	cache, lock, cacheKey := a.tokenCache, &a.refreshLock, "access_token"
 	if hiRes {
-		cache = a.tokenCacheHR
-		lock = &a.refreshLockHR
-		cacheKey = "access_token_hires"
+		cache, lock, cacheKey = a.tokenCacheHR, &a.refreshLockHR, "access_token_hires"
 	}
 
 	cache.mu.RLock()
@@ -218,71 +153,53 @@ func (a *App) getToken(hiRes bool) (string, error) {
 	cache.mu.RUnlock()
 
 	if token, err := a.redisClient.Get(ctx, cacheKey).Result(); err == nil && token != "" {
-		needsCheck := time.Since(cache.LastCheck) > tokenCheckInterval
-
-		if !needsCheck || a.quickTokenCheck(token) {
+		if time.Since(cache.LastCheck) <= tokenCheckInterval || a.quickTokenCheck(token) {
 			cache.mu.Lock()
-			cache.Token = token
-			cache.ExpiresAt = time.Now().Add(tokenCacheDuration)
-			cache.LastCheck = time.Now()
+			cache.Token, cache.ExpiresAt, cache.LastCheck = token, time.Now().Add(tokenCacheDuration), time.Now()
 			cache.mu.Unlock()
-
-			log.Printf("Using cached %s token", cacheKey)
 			return token, nil
 		}
 	}
 
-	log.Printf("Refreshing %s token...", cacheKey)
 	token, expiresIn, err := a.refreshToken(hiRes)
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("token refresh failed: %w", err)
 	}
 
 	expiryDuration := time.Duration(expiresIn) * time.Second
 	if expiryDuration > tokenCacheDuration {
 		expiryDuration = tokenCacheDuration
 	}
+	if expiryDuration <= 0 {
+		expiryDuration = time.Hour
+	}
 
 	cache.mu.Lock()
-	cache.Token = token
-	cache.ExpiresAt = time.Now().Add(expiryDuration)
-	cache.LastCheck = time.Now()
+	cache.Token, cache.ExpiresAt, cache.LastCheck = token, time.Now().Add(expiryDuration), time.Now()
 	cache.mu.Unlock()
 
 	a.redisClient.Set(ctx, cacheKey, token, expiryDuration)
-
-	log.Printf("Token refreshed successfully (expires in %s)", expiryDuration)
 	return token, nil
 }
 
 func (a *App) quickTokenCheck(token string) bool {
-	checkURL := fmt.Sprintf("https://api.tidal.com/v2/feed/activities/?userId=%s&limit=1", a.config.UserID)
+	req, resp := fasthttp.AcquireRequest(), fasthttp.AcquireResponse()
+	defer func() { fasthttp.ReleaseRequest(req); fasthttp.ReleaseResponse(resp) }()
 
-	req := fasthttp.AcquireRequest()
-	resp := fasthttp.AcquireResponse()
-	defer fasthttp.ReleaseRequest(req)
-	defer fasthttp.ReleaseResponse(resp)
-
-	req.SetRequestURI(checkURL)
-	req.Header.SetMethod(fasthttp.MethodGet)
+	var sb strings.Builder
+	sb.WriteString("https://api.tidal.com/v2/feed/activities?userId=")
+	sb.WriteString(a.config.UserID)
+	sb.WriteString("&limit=1")
+	req.SetRequestURI(sb.String())
 	req.Header.Set("Authorization", "Bearer "+token)
 
-	if err := a.httpClient.DoTimeout(req, resp, 5*time.Second); err != nil {
-		return false
-	}
-
-	return resp.StatusCode() == fasthttp.StatusOK
+	return a.httpClient.DoTimeout(req, resp, 5*time.Second) == nil && resp.StatusCode() == fasthttp.StatusOK
 }
 
 func (a *App) refreshToken(hiRes bool) (string, int, error) {
-	clientID := a.config.ClientID
-	clientSecret := a.config.ClientSecret
-	refreshToken := a.config.RefreshToken
-
+	clientID, clientSecret, refreshToken := a.config.ClientID, a.config.ClientSecret, a.config.RefreshToken
 	if hiRes {
-		clientID = a.config.ClientIDHires
-		clientSecret = a.config.ClientSecretHires
-		refreshToken = a.config.RefreshTokenHires
+		clientID, clientSecret, refreshToken = a.config.ClientIDHires, a.config.ClientSecretHires, a.config.RefreshTokenHires
 	}
 
 	form := url.Values{}
@@ -291,429 +208,333 @@ func (a *App) refreshToken(hiRes bool) (string, int, error) {
 	form.Set("grant_type", "refresh_token")
 	form.Set("scope", "r_usr+w_usr+w_sub")
 
-	req := fasthttp.AcquireRequest()
-	resp := fasthttp.AcquireResponse()
-	defer fasthttp.ReleaseRequest(req)
-	defer fasthttp.ReleaseResponse(resp)
+	req, resp := fasthttp.AcquireRequest(), fasthttp.AcquireResponse()
+	defer func() { fasthttp.ReleaseRequest(req); fasthttp.ReleaseResponse(resp) }()
 
 	req.SetRequestURI("https://auth.tidal.com/v1/oauth2/token")
 	req.Header.SetMethod(fasthttp.MethodPost)
 	req.Header.SetContentType("application/x-www-form-urlencoded")
 	req.SetBodyString(form.Encode())
-
 	auth := base64.StdEncoding.EncodeToString([]byte(clientID + ":" + clientSecret))
 	req.Header.Set("Authorization", "Basic "+auth)
 
 	if err := a.httpClient.DoTimeout(req, resp, requestTimeout); err != nil {
-		return "", 0, fmt.Errorf("token refresh failed: %w", err)
+		return "", 0, err
 	}
-
 	if resp.StatusCode() != fasthttp.StatusOK {
-		return "", 0, fmt.Errorf("token refresh failed with status %d: %s", resp.StatusCode(), resp.Body())
+		return "", 0, fmt.Errorf("status %d: %s", resp.StatusCode(), resp.Body())
 	}
 
 	var tokenResp TokenResponse
 	if err := fastJSON.Unmarshal(resp.Body(), &tokenResp); err != nil {
-		return "", 0, fmt.Errorf("failed to parse token response: %w", err)
+		return "", 0, err
 	}
-
-	if tokenResp.AccessToken == "" {
-		return "", 0, fmt.Errorf("empty access token received")
-	}
-
 	return tokenResp.AccessToken, tokenResp.ExpiresIn, nil
 }
 
 func (a *App) makeRequest(reqURL, token string) ([]byte, int, error) {
-	req := fasthttp.AcquireRequest()
-	resp := fasthttp.AcquireResponse()
-	defer fasthttp.ReleaseRequest(req)
-	defer fasthttp.ReleaseResponse(resp)
+	req, resp := fasthttp.AcquireRequest(), fasthttp.AcquireResponse()
+	defer func() { fasthttp.ReleaseRequest(req); fasthttp.ReleaseResponse(resp) }()
 
 	req.SetRequestURI(reqURL)
-	req.Header.SetMethod(fasthttp.MethodGet)
 	req.Header.Set("Authorization", "Bearer "+token)
-	req.Header.Set("Accept", "application/json")
 
 	if err := a.httpClient.DoTimeout(req, resp, requestTimeout); err != nil {
-		return nil, 0, fmt.Errorf("request failed: %w", err)
+		return nil, 0, err
 	}
 
-	statusCode := resp.StatusCode()
-	if statusCode != fasthttp.StatusOK {
-		return nil, statusCode, fmt.Errorf("status %d", statusCode)
-	}
-
-	body := make([]byte, len(resp.Body()))
-	copy(body, resp.Body())
-
-	return body, statusCode, nil
+	return resp.BodyCopy(nil), resp.StatusCode(), nil
 }
 
 func (a *App) makeRequestWithHeader(reqURL string, headers map[string]string) ([]byte, int, error) {
-	req := fasthttp.AcquireRequest()
-	resp := fasthttp.AcquireResponse()
-	defer fasthttp.ReleaseRequest(req)
-	defer fasthttp.ReleaseResponse(resp)
+	req, resp := fasthttp.AcquireRequest(), fasthttp.AcquireResponse()
+	defer func() { fasthttp.ReleaseRequest(req); fasthttp.ReleaseResponse(resp) }()
 
 	req.SetRequestURI(reqURL)
-	req.Header.SetMethod(fasthttp.MethodGet)
-
-	for key, value := range headers {
-		req.Header.Set(key, value)
+	for k, v := range headers {
+		req.Header.Set(k, v)
 	}
 
 	if err := a.httpClient.DoTimeout(req, resp, requestTimeout); err != nil {
-		return nil, 0, fmt.Errorf("request failed: %w", err)
+		return nil, 0, err
 	}
 
-	statusCode := resp.StatusCode()
-	if statusCode != fasthttp.StatusOK {
-		return nil, statusCode, fmt.Errorf("status %d", statusCode)
-	}
-
-	body := make([]byte, len(resp.Body()))
-	copy(body, resp.Body())
-
-	return body, statusCode, nil
+	return resp.BodyCopy(nil), resp.StatusCode(), nil
 }
 
-func parsePagination(c *fiber.Ctx) PaginationParams {
-	limit := c.QueryInt("limit", defaultLimit)
-	offset := c.QueryInt("offset", defaultOffset)
-
-	if limit < 1 {
-		limit = defaultLimit
-	}
-	if limit > maxLimit {
-		limit = maxLimit
-	}
-	if offset < 0 {
-		offset = defaultOffset
-	}
-
-	return PaginationParams{
-		Limit:  limit,
-		Offset: offset,
-	}
+type playbackInfoManifest struct {
+	Manifest string `json:"manifest"`
 }
-
-func createPaginatedResponse(data interface{}, limit, offset, total int) PaginatedResponse {
-	resp := PaginatedResponse{
-		Data: data,
-	}
-	resp.Pagination.Limit = limit
-	resp.Pagination.Offset = offset
-	resp.Pagination.Total = total
-	resp.Pagination.HasMore = offset+limit < total
-
-	return resp
+type manifestURL struct {
+	URLs []string `json:"urls"`
 }
 
 func (a *App) indexHandler(c *fiber.Ctx) error {
-	return c.JSON(fiber.Map{
-		"name":    "HiFi-RestAPI",
-		"version": "v2.0",
-		"repo":    "https://github.com/eduardprigoana/hifi-go",
-		"status":  "operational",
-	})
+	return c.JSON(fiber.Map{"HIFI-API": "v1.0", "Repo": "https://github.com/sachinsenal0x64/hifi"})
 }
 
 func (a *App) dashHandler(c *fiber.Ctx) error {
-	id := c.QueryInt("id", 0)
-	quality := c.Query("quality", "HI_RES_LOSSLESS")
-
-	if id == 0 {
+	id := c.Query("id")
+	if id == "" {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "id parameter required"})
 	}
-
 	token, err := a.getToken(true)
 	if err != nil {
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "token refresh failed"})
 	}
 
-	trackURL := fmt.Sprintf("https://tidal.com/v1/tracks/%d/playbackinfo?audioquality=%s&playbackmode=STREAM&assetpresentation=FULL", id, quality)
-	data, statusCode, err := a.makeRequest(trackURL, token)
+	var sb strings.Builder
+	sb.WriteString("https://tidal.com/v1/tracks/")
+	sb.WriteString(id)
+	sb.WriteString("/playbackinfo?audioquality=")
+	sb.WriteString(c.Query("quality", "HI_RES_LOSSLESS"))
+	sb.WriteString("&playbackmode=STREAM&assetpresentation=FULL")
 
-	if err != nil {
-		if statusCode == 404 {
-			return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "track not found or quality unavailable"})
-		}
-		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to fetch track"})
+	data, statusCode, err := a.makeRequest(sb.String(), token)
+	if err != nil || statusCode != fasthttp.StatusOK {
+		return c.Status(statusCode).JSON(fiber.Map{"error": "track not found or quality unavailable"})
 	}
-
-	var result map[string]interface{}
-	if err := fastJSON.Unmarshal(data, &result); err != nil {
-		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "invalid response"})
+	var result struct {
+		Manifest         string `json:"manifest"`
+		ManifestMimeType string `json:"manifestMimeType"`
 	}
-
-	manifestStr, ok := result["manifest"].(string)
-	if !ok {
+	if err := fastJSON.Unmarshal(data, &result); err != nil || result.Manifest == "" {
 		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "manifest not found"})
 	}
-
-	decoded, err := base64.StdEncoding.DecodeString(manifestStr)
+	decoded, err := base64.StdEncoding.DecodeString(result.Manifest)
 	if err != nil {
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "manifest decode failed"})
 	}
-
-	mimeType, _ := result["manifestMimeType"].(string)
-	if mimeType == "" {
-		mimeType = "application/dash+xml"
-	}
-
-	c.Set(fiber.HeaderContentType, mimeType)
-	c.Set(fiber.HeaderCacheControl, "public, max-age=3600")
+	c.Set(fiber.HeaderContentType, result.ManifestMimeType)
 	return c.Send(decoded)
 }
 
 func (a *App) trackHandler(c *fiber.Ctx) error {
-	id := c.QueryInt("id", 0)
+	id := c.Query("id")
 	quality := c.Query("quality", "LOSSLESS")
-
-	if id == 0 {
+	if id == "" {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "id parameter required"})
 	}
-
 	if quality == "HI_RES_LOSSLESS" {
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
-			"error": "HI_RES_LOSSLESS not supported on this endpoint",
-			"hint":  "Use /dash/ endpoint for HI_RES_LOSSLESS quality",
-		})
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "HI_RES_LOSSLESS not supported on this endpoint. Use /dash/ endpoint instead which returns MPEG-DASH."})
 	}
-
 	token, err := a.getToken(false)
 	if err != nil {
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "token refresh failed"})
 	}
 
-	trackURL := fmt.Sprintf("https://api.tidal.com/v1/tracks/%d/playbackinfopostpaywall/v4?audioquality=%s&playbackmode=STREAM&assetpresentation=FULL", id, quality)
-	infoURL := fmt.Sprintf("https://api.tidal.com/v1/tracks/%d/?countryCode=US", id)
-
-	var trackData, infoData []byte
-	var trackErr, infoErr error
 	var wg sync.WaitGroup
+	var infoData, trackData []byte
+	var infoErr, trackErr error
 	wg.Add(2)
 
 	go func() {
 		defer wg.Done()
-		trackData, _, trackErr = a.makeRequest(trackURL, token)
+		var sb strings.Builder
+		sb.WriteString("https://api.tidal.com/v1/tracks/")
+		sb.WriteString(id)
+		sb.WriteString("/?countryCode=US")
+		infoData, _, infoErr = a.makeRequest(sb.String(), token)
 	}()
-
 	go func() {
 		defer wg.Done()
-		infoData, _, infoErr = a.makeRequest(infoURL, token)
+		var sb strings.Builder
+		sb.WriteString("https://api.tidal.com/v1/tracks/")
+		sb.WriteString(id)
+		sb.WriteString("/playbackinfopostpaywall/v4?audioquality=")
+		sb.WriteString(quality)
+		sb.WriteString("&playbackmode=STREAM&assetpresentation=FULL")
+		trackData, _, trackErr = a.makeRequest(sb.String(), token)
 	}()
-
 	wg.Wait()
 
-	if trackErr != nil || infoErr != nil {
+	if infoErr != nil || trackErr != nil {
 		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "track not found or quality unavailable"})
 	}
 
-	var trackResult, infoResult map[string]interface{}
-	fastJSON.Unmarshal(trackData, &trackResult)
+	var infoResult, trackResult map[string]interface{}
+	var pbm playbackInfoManifest
 	fastJSON.Unmarshal(infoData, &infoResult)
+	fastJSON.Unmarshal(trackData, &trackResult)
+	fastJSON.Unmarshal(trackData, &pbm)
 
-	manifestStr, _ := trackResult["manifest"].(string)
-	decoded, _ := base64.StdEncoding.DecodeString(manifestStr)
-
-	var manifestJSON map[string]interface{}
-	fastJSON.Unmarshal(decoded, &manifestJSON)
-
+	decoded, _ := base64.StdEncoding.DecodeString(pbm.Manifest)
+	var mu manifestURL
+	fastJSON.Unmarshal(decoded, &mu)
 	audioURL := ""
-	if urls, ok := manifestJSON["urls"].([]interface{}); ok && len(urls) > 0 {
-		audioURL, _ = urls[0].(string)
+	if len(mu.URLs) > 0 {
+		audioURL = mu.URLs[0]
 	}
 
-	return c.JSON(fiber.Map{
-		"track":    infoResult,
-		"playback": trackResult,
-		"url":      audioURL,
-	})
+	return c.JSON([]interface{}{infoResult, trackResult, fiber.Map{"OriginalTrackUrl": audioURL}})
 }
 
 func (a *App) lyricsHandler(c *fiber.Ctx) error {
-	id := c.QueryInt("id", 0)
-	if id == 0 {
+	id := c.Query("id")
+	if id == "" {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "id parameter required"})
 	}
-
 	token, _ := a.getToken(false)
-	lyricsURL := fmt.Sprintf("https://api.tidal.com/v1/tracks/%d/lyrics?countryCode=US&locale=en_US&deviceType=BROWSER", id)
+	var sb strings.Builder
+	sb.WriteString("https://api.tidal.com/v1/tracks/")
+	sb.WriteString(id)
+	sb.WriteString("/lyrics?countryCode=US&locale=en_US&deviceType=BROWSER")
 
-	data, statusCode, err := a.makeRequest(lyricsURL, token)
-	if err != nil {
-		if statusCode == 404 {
-			return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "lyrics not found"})
-		}
-		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to fetch lyrics"})
+	data, statusCode, err := a.makeRequest(sb.String(), token)
+	if err != nil || statusCode != fasthttp.StatusOK {
+		return c.Status(statusCode).JSON(fiber.Map{"error": "failed to fetch lyrics"})
 	}
-
 	var result map[string]interface{}
 	fastJSON.Unmarshal(data, &result)
-	return c.JSON(result)
+	return c.JSON([]interface{}{result})
 }
 
 func (a *App) songHandler(c *fiber.Ctx) error {
 	q := c.Query("q")
-	quality := c.Query("quality", "LOSSLESS")
-
 	if q == "" {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "q parameter required"})
 	}
-
-	token, _ := a.getToken(false)
-	searchURL := fmt.Sprintf("https://api.tidal.com/v1/search/tracks?countryCode=US&query=%s", url.QueryEscape(q))
-
-	searchData, _, err := a.makeRequest(searchURL, token)
+	token, err := a.getToken(false)
 	if err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "token refresh failed"})
+	}
+
+	var sb strings.Builder
+	sb.WriteString("https://api.tidal.com/v1/search/tracks?countryCode=US&query=")
+	sb.WriteString(url.QueryEscape(q))
+	sb.WriteString("&limit=1")
+
+	searchData, statusCode, err := a.makeRequest(sb.String(), token)
+	if err != nil || statusCode != fasthttp.StatusOK {
 		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "search failed"})
 	}
 
-	var searchResult map[string]interface{}
-	fastJSON.Unmarshal(searchData, &searchResult)
-
-	items, _ := searchResult["items"].([]interface{})
-	if len(items) == 0 {
+	var searchResult struct {
+		Items []map[string]interface{} `json:"items"`
+	}
+	if err := fastJSON.Unmarshal(searchData, &searchResult); err != nil || len(searchResult.Items) == 0 {
 		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "no results found"})
 	}
 
-	firstItem, _ := items[0].(map[string]interface{})
-	trackID := int(firstItem["id"].(float64))
-
-	trackURL := fmt.Sprintf("https://api.tidal.com/v1/tracks/%d/playbackinfopostpaywall/v4?audioquality=%s&playbackmode=STREAM&assetpresentation=FULL", trackID, quality)
-	trackData, _, _ := a.makeRequest(trackURL, token)
-
-	var trackResult map[string]interface{}
-	fastJSON.Unmarshal(trackData, &trackResult)
-
-	manifestStr, _ := trackResult["manifest"].(string)
-	decoded, _ := base64.StdEncoding.DecodeString(manifestStr)
-
-	var manifestJSON map[string]interface{}
-	fastJSON.Unmarshal(decoded, &manifestJSON)
-
-	audioURL := ""
-	if urls, ok := manifestJSON["urls"].([]interface{}); ok && len(urls) > 0 {
-		audioURL, _ = urls[0].(string)
+	firstItem := searchResult.Items[0]
+	trackID, ok := firstItem["id"].(float64)
+	if !ok {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "invalid track ID in search result"})
 	}
 
-	return c.JSON(fiber.Map{
-		"track":    firstItem,
-		"playback": trackResult,
-		"url":      audioURL,
-	})
+	sb.Reset()
+	sb.WriteString("https://api.tidal.com/v1/tracks/")
+	sb.WriteString(fmt.Sprintf("%.0f", trackID))
+	sb.WriteString("/playbackinfopostpaywall/v4?audioquality=")
+	sb.WriteString(c.Query("quality", "LOSSLESS"))
+	sb.WriteString("&playbackmode=STREAM&assetpresentation=FULL")
+
+	trackData, _, _ := a.makeRequest(sb.String(), token)
+	var trackResult map[string]interface{}
+	var pbm playbackInfoManifest
+	fastJSON.Unmarshal(trackData, &trackResult)
+	fastJSON.Unmarshal(trackData, &pbm)
+	decoded, _ := base64.StdEncoding.DecodeString(pbm.Manifest)
+
+	var mu manifestURL
+	fastJSON.Unmarshal(decoded, &mu)
+	audioURL := ""
+	if len(mu.URLs) > 0 {
+		audioURL = mu.URLs[0]
+	}
+
+	return c.JSON([]interface{}{firstItem, trackResult, fiber.Map{"OriginalTrackUrl": audioURL}})
 }
 
 func (a *App) searchHandler(c *fiber.Ctx) error {
-	s := c.Query("s")
-	artist := c.Query("a")
-	album := c.Query("al")
-	video := c.Query("v")
-	playlist := c.Query("p")
+	token, err := a.getToken(false)
+	if err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "token refresh failed"})
+	}
 
-	pagination := parsePagination(c)
-
-	token, _ := a.getToken(false)
-	var searchURL string
-	var searchType string
-
+	var sb strings.Builder
+	var isArtistSearch bool
 	switch {
-	case s != "":
-		searchURL = fmt.Sprintf("https://api.tidal.com/v1/search/tracks?query=%s&limit=%d&offset=%d&countryCode=US",
-			url.QueryEscape(s), pagination.Limit, pagination.Offset)
-		searchType = "tracks"
-	case artist != "":
-		searchURL = fmt.Sprintf("https://api.tidal.com/v1/search/top-hits?query=%s&limit=%d&offset=%d&types=ARTISTS,TRACKS&countryCode=US",
-			url.QueryEscape(artist), pagination.Limit, pagination.Offset)
-		searchType = "artists"
-	case album != "":
-		searchURL = fmt.Sprintf("https://api.tidal.com/v1/search/top-hits?query=%s&limit=%d&offset=%d&types=ALBUMS&countryCode=US",
-			url.QueryEscape(album), pagination.Limit, pagination.Offset)
-		searchType = "albums"
-	case video != "":
-		searchURL = fmt.Sprintf("https://api.tidal.com/v1/search/top-hits?query=%s&limit=%d&offset=%d&types=VIDEOS&countryCode=US",
-			url.QueryEscape(video), pagination.Limit, pagination.Offset)
-		searchType = "videos"
-	case playlist != "":
-		searchURL = fmt.Sprintf("https://api.tidal.com/v1/search/top-hits?query=%s&limit=%d&offset=%d&types=PLAYLISTS&countryCode=US",
-			url.QueryEscape(playlist), pagination.Limit, pagination.Offset)
-		searchType = "playlists"
+	case c.Query("s") != "":
+		sb.WriteString("https://api.tidal.com/v1/search/tracks?query=")
+		sb.WriteString(url.QueryEscape(c.Query("s")))
+	case c.Query("a") != "":
+		sb.WriteString("https://api.tidal.com/v1/search/top-hits?query=")
+		sb.WriteString(url.QueryEscape(c.Query("a")))
+		sb.WriteString("&types=ARTISTS,TRACKS")
+		isArtistSearch = true
+	case c.Query("al") != "":
+		sb.WriteString("https://api.tidal.com/v1/search/top-hits?query=")
+		sb.WriteString(url.QueryEscape(c.Query("al")))
+		sb.WriteString("&types=ALBUMS")
+	case c.Query("v") != "":
+		sb.WriteString("https://api.tidal.com/v1/search/top-hits?query=")
+		sb.WriteString(url.QueryEscape(c.Query("v")))
+		sb.WriteString("&types=VIDEOS")
+	case c.Query("p") != "":
+		sb.WriteString("https://api.tidal.com/v1/search/top-hits?query=")
+		sb.WriteString(url.QueryEscape(c.Query("p")))
+		sb.WriteString("&types=PLAYLISTS")
 	default:
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "search parameter required (s, a, al, v, or p)"})
 	}
+	fmt.Fprintf(&sb, "&limit=%d&offset=%d&countryCode=US", c.QueryInt("li", 25), c.QueryInt("o", 0))
 
-	data, _, err := a.makeRequest(searchURL, token)
+	data, _, err := a.makeRequest(sb.String(), token)
 	if err != nil {
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "search failed"})
 	}
 
 	var result map[string]interface{}
 	fastJSON.Unmarshal(data, &result)
-
-	var items []interface{}
-	var total int
-
-	if searchType == "tracks" {
-		items, _ = result["items"].([]interface{})
-		if totalCount, ok := result["totalNumberOfItems"].(float64); ok {
-			total = int(totalCount)
-		}
-	} else {
-		items, _ = result["items"].([]interface{})
-		total = len(items)
+	if isArtistSearch {
+		return c.JSON([]interface{}{result})
 	}
-
-	response := createPaginatedResponse(items, pagination.Limit, pagination.Offset, total)
-	return c.JSON(response)
+	return c.JSON(result)
 }
 
 func (a *App) albumHandler(c *fiber.Ctx) error {
-	id := c.QueryInt("id", 0)
-	if id == 0 {
+	id := c.Query("id")
+	if id == "" {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "id parameter required"})
 	}
+	token, err := a.getToken(false)
+	if err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "token refresh failed"})
+	}
 
-	pagination := parsePagination(c)
-	token, _ := a.getToken(false)
-
-	albumURL := fmt.Sprintf("https://api.tidal.com/v1/albums/%d/?countryCode=US", id)
-	itemsURL := fmt.Sprintf("https://api.tidal.com/v1/albums/%d/items?limit=%d&offset=%d&countryCode=US",
-		id, pagination.Limit, pagination.Offset)
-
-	var albumData, itemsData []byte
 	var wg sync.WaitGroup
+	var albumData, itemsData []byte
+	var albumErr, itemsErr error
 	wg.Add(2)
 
 	go func() {
 		defer wg.Done()
-		albumData, _, _ = a.makeRequest(albumURL, token)
+		var sb strings.Builder
+		sb.WriteString("https://api.tidal.com/v1/albums/")
+		sb.WriteString(id)
+		sb.WriteString("/?countryCode=US")
+		albumData, _, albumErr = a.makeRequest(sb.String(), token)
 	}()
-
 	go func() {
 		defer wg.Done()
-		itemsData, _, _ = a.makeRequest(itemsURL, token)
+		var sb strings.Builder
+		sb.WriteString("https://api.tidal.com/v1/albums/")
+		sb.WriteString(id)
+		sb.WriteString("/items?limit=100&countryCode=US")
+		itemsData, _, itemsErr = a.makeRequest(sb.String(), token)
 	}()
-
 	wg.Wait()
+
+	if albumErr != nil || itemsErr != nil {
+		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "album or items not found"})
+	}
 
 	var albumResult, itemsResult map[string]interface{}
 	fastJSON.Unmarshal(albumData, &albumResult)
 	fastJSON.Unmarshal(itemsData, &itemsResult)
 
-	items, _ := itemsResult["items"].([]interface{})
-	total := 0
-	if totalCount, ok := itemsResult["totalNumberOfItems"].(float64); ok {
-		total = int(totalCount)
-	}
-
-	response := fiber.Map{
-		"album": albumResult,
-		"items": createPaginatedResponse(items, pagination.Limit, pagination.Offset, total),
-	}
-
-	return c.JSON(response)
+	return c.JSON([]interface{}{albumResult, itemsResult})
 }
 
 func (a *App) playlistHandler(c *fiber.Ctx) error {
@@ -721,192 +542,255 @@ func (a *App) playlistHandler(c *fiber.Ctx) error {
 	if id == "" {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "id parameter required"})
 	}
+	token, err := a.getToken(false)
+	if err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "token refresh failed"})
+	}
 
-	pagination := parsePagination(c)
-	token, _ := a.getToken(false)
-
-	playlistURL := fmt.Sprintf("https://api.tidal.com/v1/playlists/%s?countryCode=US", id)
-	itemsURL := fmt.Sprintf("https://api.tidal.com/v1/playlists/%s/items?countryCode=US&limit=%d&offset=%d",
-		id, pagination.Limit, pagination.Offset)
-
-	var playlistData, itemsData []byte
 	var wg sync.WaitGroup
+	var playlistData, itemsData []byte
+	var playlistErr, itemsErr error
 	wg.Add(2)
 
 	go func() {
 		defer wg.Done()
-		playlistData, _, _ = a.makeRequest(playlistURL, token)
+		var sb strings.Builder
+		sb.WriteString("https://api.tidal.com/v1/playlists/")
+		sb.WriteString(id)
+		sb.WriteString("?countryCode=US")
+		playlistData, _, playlistErr = a.makeRequest(sb.String(), token)
 	}()
-
 	go func() {
 		defer wg.Done()
-		itemsData, _, _ = a.makeRequest(itemsURL, token)
+		var sb strings.Builder
+		sb.WriteString("https://api.tidal.com/v1/playlists/")
+		sb.WriteString(id)
+		sb.WriteString("/items?countryCode=US&limit=100")
+		itemsData, _, itemsErr = a.makeRequest(sb.String(), token)
 	}()
-
 	wg.Wait()
+
+	if playlistErr != nil || itemsErr != nil {
+		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "playlist or items not found"})
+	}
 
 	var playlistResult, itemsResult map[string]interface{}
 	fastJSON.Unmarshal(playlistData, &playlistResult)
 	fastJSON.Unmarshal(itemsData, &itemsResult)
+	return c.JSON([]interface{}{playlistResult, itemsResult})
+}
 
-	items, _ := itemsResult["items"].([]interface{})
-	total := 0
-	if totalCount, ok := itemsResult["totalNumberOfItems"].(float64); ok {
-		total = int(totalCount)
-	}
+type artistPageAlbums struct {
+	Rows []struct {
+		Modules []struct {
+			PagedList struct {
+				Items []struct {
+					ID float64 `json:"id"`
+				} `json:"items"`
+			} `json:"pagedList"`
+		} `json:"modules"`
+	} `json:"rows"`
+}
 
-	response := fiber.Map{
-		"playlist": playlistResult,
-		"items":    createPaginatedResponse(items, pagination.Limit, pagination.Offset, total),
-	}
-
-	return c.JSON(response)
+type albumPageTracks struct {
+	Rows []struct {
+		Modules []struct {
+			PagedList struct {
+				Items []struct {
+					Item interface{} `json:"item"`
+				} `json:"items"`
+			} `json:"pagedList"`
+		} `json:"modules"`
+	} `json:"rows"`
 }
 
 func (a *App) artistHandler(c *fiber.Ctx) error {
-	id := c.QueryInt("id", 0)
-	f := c.QueryInt("f", 0)
-
-	if id == 0 && f == 0 {
+	id, f := c.Query("id"), c.Query("f")
+	if id == "" && f == "" {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "id or f parameter required"})
 	}
+	token, err := a.getToken(false)
+	if err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "token refresh failed"})
+	}
 
-	token, _ := a.getToken(false)
-
-	if id > 0 {
-		artistURL := fmt.Sprintf("https://api.tidal.com/v1/artists/%d?countryCode=US", id)
-		data, statusCode, err := a.makeRequest(artistURL, token)
-
-		if err != nil && statusCode == 404 {
-			altURL := fmt.Sprintf("https://api.tidal.com/v1/pages/artist?artistId=%d&countryCode=US&locale=en_US&deviceType=BROWSER", id)
-			data, _, _ = a.makeRequest(altURL, token)
+	var sb strings.Builder
+	if id != "" {
+		sb.WriteString("https://api.tidal.com/v1/artists/")
+		sb.WriteString(id)
+		sb.WriteString("?countryCode=US")
+		data, statusCode, err := a.makeRequest(sb.String(), token)
+		if err != nil || statusCode == fasthttp.StatusNotFound {
+			sb.Reset()
+			sb.WriteString("https://api.tidal.com/v1/pages/artist?artistId=")
+			sb.WriteString(id)
+			sb.WriteString("&countryCode=US&locale=en_US&deviceType=BROWSER")
+			data, _, _ := a.makeRequest(sb.String(), token)
 			var result map[string]interface{}
 			fastJSON.Unmarshal(data, &result)
-			return c.JSON(result)
+			return c.JSON([]interface{}{result})
 		}
 
-		var artistResult map[string]interface{}
+		var artistResult struct {
+			ID      float64 `json:"id"`
+			Name    string  `json:"name"`
+			Picture string  `json:"picture"`
+		}
+		var fullResult map[string]interface{}
 		fastJSON.Unmarshal(data, &artistResult)
+		fastJSON.Unmarshal(data, &fullResult)
 
-		picture, _ := artistResult["picture"].(string)
-		name, _ := artistResult["name"].(string)
-		artistID, _ := artistResult["id"].(float64)
-		artistCover := strings.ReplaceAll(picture, "-", "/")
+		sb.Reset()
+		sb.WriteString("https://resources.tidal.com/images/")
+		sb.WriteString(strings.ReplaceAll(artistResult.Picture, "-", "/"))
+		basePath := sb.String()
 
-		imageData := map[string]interface{}{
-			"id":   int(artistID),
-			"name": name,
-			"750":  fmt.Sprintf("https://resources.tidal.com/images/%s/750x750.jpg", artistCover),
-			"1080": fmt.Sprintf("https://resources.tidal.com/images/%s/1080x1080.jpg", artistCover),
-		}
-
-		return c.JSON(fiber.Map{
-			"artist": artistResult,
-			"image":  imageData,
-		})
+		jsonData := []fiber.Map{{"id": int(artistResult.ID), "name": artistResult.Name, "750": basePath + "/750x750.jpg"}}
+		return c.JSON([]interface{}{fullResult, jsonData})
 	}
 
-	if f > 0 {
-		pagination := parsePagination(c)
-		artistAlbumsURL := fmt.Sprintf("https://api.tidal.com/v1/pages/single-module-page/ae223310-a4c2-4568-a770-ffef70344441/4/a4f964ba-b52e-41e8-b25c-06cd70c1efad/2?artistId=%d&countryCode=US&deviceType=BROWSER&limit=%d&offset=%d",
-			f, pagination.Limit, pagination.Offset)
-		albumData, _, _ := a.makeRequest(artistAlbumsURL, token)
+	if f != "" {
+		sb.WriteString("https://api.tidal.com/v1/pages/single-module-page/ae223310-a4c2-4568-a770-ffef70344441/4/a4f964ba-b52e-41e8-b25c-06cd70c1efad/2?artistId=")
+		sb.WriteString(f)
+		sb.WriteString("&countryCode=US&deviceType=BROWSER")
+		albumData, _, err := a.makeRequest(sb.String(), token)
+		if err != nil {
+			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to fetch artist albums"})
+		}
 
 		var albumsResult map[string]interface{}
+		var albumsParsed artistPageAlbums
 		fastJSON.Unmarshal(albumData, &albumsResult)
-		return c.JSON(albumsResult)
-	}
+		fastJSON.Unmarshal(albumData, &albumsParsed)
 
+		if len(albumsParsed.Rows) == 0 || len(albumsParsed.Rows[0].Modules) == 0 {
+			return c.JSON([]interface{}{albumsResult})
+		}
+		albumItems := albumsParsed.Rows[0].Modules[0].PagedList.Items
+		allTracksSlices := make([][]interface{}, len(albumItems))
+		var wg sync.WaitGroup
+
+		for i, item := range albumItems {
+			wg.Add(1)
+			go func(idx int, albumID float64) {
+				defer wg.Done()
+				var sbURL strings.Builder
+				sbURL.WriteString("https://api.tidal.com/v1/pages/album?albumId=")
+				sbURL.WriteString(fmt.Sprintf("%.0f", albumID))
+				sbURL.WriteString("&countryCode=US&deviceType=BROWSER")
+
+				albumInfoData, _, _ := a.makeRequest(sbURL.String(), token)
+				var albumInfoParsed albumPageTracks
+				fastJSON.Unmarshal(albumInfoData, &albumInfoParsed)
+
+				if len(albumInfoParsed.Rows) > 1 && len(albumInfoParsed.Rows[1].Modules) > 0 {
+					trackItems := albumInfoParsed.Rows[1].Modules[0].PagedList.Items
+					tracks := make([]interface{}, len(trackItems))
+					for j, trackItem := range trackItems {
+						tracks[j] = trackItem.Item
+					}
+					allTracksSlices[idx] = tracks
+				}
+			}(i, item.ID)
+		}
+		wg.Wait()
+
+		var totalTracks int
+		for _, s := range allTracksSlices {
+			totalTracks += len(s)
+		}
+		allTracks := make([]interface{}, 0, totalTracks)
+		for _, s := range allTracksSlices {
+			allTracks = append(allTracks, s...)
+		}
+		return c.JSON([]interface{}{albumsResult, allTracks})
+	}
 	return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid parameters"})
 }
 
 func (a *App) coverHandler(c *fiber.Ctx) error {
-	id := c.QueryInt("id", 0)
-	q := c.Query("q")
-
-	if id == 0 && q == "" {
+	id, q := c.Query("id"), c.Query("q")
+	if id == "" && q == "" {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "id or q parameter required"})
 	}
+	token, err := a.getToken(false)
+	if err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "token refresh failed"})
+	}
 
-	token, _ := a.getToken(false)
-
-	if id > 0 {
-		trackURL := fmt.Sprintf("https://api.tidal.com/v1/tracks/%d/?countryCode=US", id)
-		data, _, err := a.makeRequest(trackURL, token)
+	var sb strings.Builder
+	if id != "" {
+		sb.WriteString("https://api.tidal.com/v1/tracks/")
+		sb.WriteString(id)
+		sb.WriteString("/?countryCode=US")
+		data, _, err := a.makeRequest(sb.String(), token)
 		if err != nil {
 			return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "track not found"})
 		}
-
-		var trackResult map[string]interface{}
+		var trackResult struct {
+			Album struct {
+				ID    float64 `json:"id"`
+				Title string  `json:"title"`
+				Cover string  `json:"cover"`
+			} `json:"album"`
+		}
 		fastJSON.Unmarshal(data, &trackResult)
 
-		album, _ := trackResult["album"].(map[string]interface{})
-		albumID, _ := album["id"].(float64)
-		title, _ := album["title"].(string)
-		cover, _ := album["cover"].(string)
-		coverPath := strings.ReplaceAll(cover, "-", "/")
+		sb.Reset()
+		sb.WriteString("https://resources.tidal.com/images/")
+		sb.WriteString(strings.ReplaceAll(trackResult.Album.Cover, "-", "/"))
+		basePath := sb.String()
 
-		return c.JSON(map[string]interface{}{
-			"id":   int(albumID),
-			"name": title,
-			"1280": fmt.Sprintf("https://resources.tidal.com/images/%s/1280x1280.jpg", coverPath),
-			"640":  fmt.Sprintf("https://resources.tidal.com/images/%s/640x640.jpg", coverPath),
-			"320":  fmt.Sprintf("https://resources.tidal.com/images/%s/320x320.jpg", coverPath),
-			"80":   fmt.Sprintf("https://resources.tidal.com/images/%s/80x80.jpg", coverPath),
-		})
+		jsonData := []fiber.Map{{"id": int(trackResult.Album.ID), "name": trackResult.Album.Title, "1280": basePath + "/1280x1280.jpg", "640": basePath + "/640x640.jpg", "80": basePath + "/80x80.jpg"}}
+		return c.JSON(jsonData)
 	}
 
-	pagination := parsePagination(c)
-	searchURL := fmt.Sprintf("https://api.tidal.com/v1/search/tracks?countryCode=US&query=%s&limit=%d&offset=%d",
-		url.QueryEscape(q), pagination.Limit, pagination.Offset)
-	data, _, err := a.makeRequest(searchURL, token)
+	sb.WriteString("https://api.tidal.com/v1/search/tracks?countryCode=US&query=")
+	sb.WriteString(url.QueryEscape(q))
+	data, _, err := a.makeRequest(sb.String(), token)
 	if err != nil {
 		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "search failed"})
 	}
-
-	var searchResult map[string]interface{}
+	var searchResult struct {
+		Items []struct {
+			ID    float64 `json:"id"`
+			Title string  `json:"title"`
+			Album struct {
+				Cover string `json:"cover"`
+			} `json:"album"`
+		} `json:"items"`
+	}
 	fastJSON.Unmarshal(data, &searchResult)
+	items := searchResult.Items
+	if len(items) > 10 {
+		items = items[:10]
+	}
 
-	items, _ := searchResult["items"].([]interface{})
-	jsonData := make([]map[string]interface{}, 0, len(items))
-
+	jsonData := make([]fiber.Map, 0, len(items))
 	for _, item := range items {
-		track, _ := item.(map[string]interface{})
-		trackID, _ := track["id"].(float64)
-		title, _ := track["title"].(string)
-		album, _ := track["album"].(map[string]interface{})
-		cover, _ := album["cover"].(string)
-		coverPath := strings.ReplaceAll(cover, "-", "/")
-
-		jsonData = append(jsonData, map[string]interface{}{
-			"id":   int(trackID),
-			"name": title,
-			"1280": fmt.Sprintf("https://resources.tidal.com/images/%s/1280x1280.jpg", coverPath),
-			"640":  fmt.Sprintf("https://resources.tidal.com/images/%s/640x640.jpg", coverPath),
-			"320":  fmt.Sprintf("https://resources.tidal.com/images/%s/320x320.jpg", coverPath),
-			"80":   fmt.Sprintf("https://resources.tidal.com/images/%s/80x80.jpg", coverPath),
-		})
+		sb.Reset()
+		sb.WriteString("https://resources.tidal.com/images/")
+		sb.WriteString(strings.ReplaceAll(item.Album.Cover, "-", "/"))
+		basePath := sb.String()
+		jsonData = append(jsonData, fiber.Map{"id": int(item.ID), "name": item.Title, "1280": basePath + "/1280x1280.jpg", "640": basePath + "/640x640.jpg", "80": basePath + "/80x80.jpg"})
 	}
-
-	total := 0
-	if totalCount, ok := searchResult["totalNumberOfItems"].(float64); ok {
-		total = int(totalCount)
-	}
-
-	response := createPaginatedResponse(jsonData, pagination.Limit, pagination.Offset, total)
-	return c.JSON(response)
+	return c.JSON(jsonData)
 }
 
 func (a *App) homeHandler(c *fiber.Ctx) error {
-	country := strings.ToUpper(c.Query("country", "US"))
-	token, _ := a.getToken(false)
+	token, err := a.getToken(false)
+	if err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "token refresh failed"})
+	}
 
-	homeURL := fmt.Sprintf("https://api.tidal.com/v1/pages/home?countryCode=%s&deviceType=BROWSER", country)
-	data, _, err := a.makeRequest(homeURL, token)
+	var sb strings.Builder
+	sb.WriteString("https://api.tidal.com/v1/pages/home?countryCode=")
+	sb.WriteString(strings.ToUpper(c.Query("country", "US")))
+	sb.WriteString("&deviceType=BROWSER")
+	data, _, err := a.makeRequest(sb.String(), token)
 	if err != nil {
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to fetch home"})
 	}
-
 	var result map[string]interface{}
 	fastJSON.Unmarshal(data, &result)
 	return c.JSON(result)
@@ -914,36 +798,23 @@ func (a *App) homeHandler(c *fiber.Ctx) error {
 
 func (a *App) mixHandler(c *fiber.Ctx) error {
 	id := c.Query("id")
-	country := strings.ToUpper(c.Query("country", "US"))
-
 	if id == "" {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "id parameter required"})
 	}
+	var sb strings.Builder
+	sb.WriteString("https://api.tidal.com/v1/mixes/")
+	sb.WriteString(id)
+	sb.WriteString("/items?countryCode=")
+	sb.WriteString(strings.ToUpper(c.Query("country", "US")))
 
-	pagination := parsePagination(c)
-	mixURL := fmt.Sprintf("https://api.tidal.com/v1/mixes/%s/items?countryCode=%s&limit=%d&offset=%d",
-		id, country, pagination.Limit, pagination.Offset)
-
-	headers := map[string]string{
-		"x-tidal-token": a.config.ClientID,
-	}
-
-	data, _, err := a.makeRequestWithHeader(mixURL, headers)
+	headers := map[string]string{"x-tidal-token": a.config.ClientID}
+	data, _, err := a.makeRequestWithHeader(sb.String(), headers)
 	if err != nil {
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "request failed"})
 	}
-
 	var result map[string]interface{}
 	fastJSON.Unmarshal(data, &result)
-
-	items, _ := result["items"].([]interface{})
-	total := 0
-	if totalCount, ok := result["totalNumberOfItems"].(float64); ok {
-		total = int(totalCount)
-	}
-
-	response := createPaginatedResponse(items, pagination.Limit, pagination.Offset, total)
-	return c.JSON(response)
+	return c.JSON(result)
 }
 
 func main() {
@@ -951,43 +822,19 @@ func main() {
 	defer app.redisClient.Close()
 
 	fiberApp := fiber.New(fiber.Config{
-		Prefork:               false,
-		CaseSensitive:         true,
-		StrictRouting:         false,
-		ServerHeader:          "HiFi-Go",
-		AppName:               "HiFi-RestAPI v2.0",
-		BodyLimit:             50 * 1024 * 1024,
-		ReadTimeout:           30 * time.Second,
-		WriteTimeout:          30 * time.Second,
-		IdleTimeout:           120 * time.Second,
-		DisableStartupMessage: false,
-		EnablePrintRoutes:     false,
-		JSONEncoder:           fastJSON.Marshal,
-		JSONDecoder:           fastJSON.Unmarshal,
+		Prefork:       false,
+		CaseSensitive: true,
+		ServerHeader:  "HiFi-Go",
+		AppName:       "HiFi-RestAPI v1.0",
+		JSONEncoder:   fastJSON.Marshal,
+		JSONDecoder:   fastJSON.Unmarshal,
 	})
-
-	fiberApp.Use(recover.New(recover.Config{
-		EnableStackTrace: true,
-	}))
-
-	fiberApp.Use(logger.New(logger.Config{
-		Format:     "${time} | ${status} | ${latency} | ${method} ${path}\n",
-		TimeFormat: "15:04:05",
-		TimeZone:   "Local",
-	}))
-
-	fiberApp.Use(compress.New(compress.Config{
-		Level: compress.LevelBestSpeed,
-	}))
-
-	fiberApp.Use(cors.New(cors.Config{
-		AllowOrigins:     "*",
-		AllowMethods:     "GET,POST,HEAD,OPTIONS",
-		AllowHeaders:     "*",
-		AllowCredentials: false,
-		ExposeHeaders:    "*",
-		MaxAge:           86400,
-	}))
+	fiberApp.Use(
+		recover.New(),
+		logger.New(logger.Config{Format: "${time} | ${status} | ${latency} | ${method} ${path}\n", TimeFormat: "15:04:05"}),
+		compress.New(),
+		cors.New(cors.Config{AllowOrigins: "*", AllowMethods: "GET"}),
+	)
 
 	fiberApp.Get("/", app.indexHandler)
 	fiberApp.Get("/dash/", app.dashHandler)
@@ -1004,18 +851,13 @@ func main() {
 
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
-
 	go func() {
 		<-sigChan
-		log.Println("Shutting down gracefully...")
-		if err := fiberApp.Shutdown(); err != nil {
-			log.Printf("Shutdown error: %v", err)
-		}
+		log.Println("Shutting down...")
+		_ = fiberApp.Shutdown()
 	}()
 
 	log.Printf("Server starting on port %s", app.config.Port)
-	log.Printf("API Documentation: https://github.com/eduardprigoana/hifi-go")
-
 	if err := fiberApp.Listen(":" + app.config.Port); err != nil {
 		log.Fatalf("Server failed to start: %v", err)
 	}
