@@ -23,6 +23,7 @@ import (
 	jsoniter "github.com/json-iterator/go"
 	"github.com/redis/go-redis/v9"
 	"github.com/valyala/fasthttp"
+	"github.comcom/gofiber/fiber/v2/middleware/compress"
 )
 
 var fastJSON = jsoniter.ConfigCompatibleWithStandardLibrary
@@ -498,7 +499,7 @@ func (a *App) searchHandler(c *fiber.Ctx) error {
 		sb.WriteString("https://api.tidal.com/v1/search/top-hits?query=")
 		sb.WriteString(url.QueryEscape(c.Query("v")))
 		sb.WriteString("&types=VIDEOS")
-	case cQuery("p") != "":
+	case c.Query("p") != "": // <-- FIX: Was cQuery("p")
 		sb.WriteString("https://api.tidal.com/v1/search/top-hits?query=")
 		sb.WriteString(url.QueryEscape(c.Query("p")))
 		sb.WriteString("&types=PLAYLISTS")
@@ -636,7 +637,7 @@ type albumPageTracks struct {
 }
 
 func (a *App) artistHandler(c *fiber.Ctx) error {
-	id, f := c.Query("id"), cQuery("f")
+	id, f := c.Query("id"), c.Query("f") // <-- FIX: Was cQuery("f")
 	if id == "" && f == "" {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "id or f parameter required"})
 	}
@@ -848,7 +849,7 @@ func (a *App) mixHandler(c *fiber.Ctx) error {
 	if err != nil || statusCode != fasthttp.StatusOK {
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "request failed"})
 	}
-	c.Set(fiberHeaderContentType, fiber.MIMEApplicationJSON)
+	c.Set(fiber.HeaderContentType, fiber.MIMEApplicationJSON) // <-- FIX: Was fiberHeaderContentType
 	return c.Send(data)
 }
 
