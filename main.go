@@ -23,7 +23,6 @@ import (
 	jsoniter "github.com/json-iterator/go"
 	"github.com/redis/go-redis/v9"
 	"github.com/valyala/fasthttp"
-	"github.comcom/gofiber/fiber/v2/middleware/compress"
 )
 
 var fastJSON = jsoniter.ConfigCompatibleWithStandardLibrary
@@ -276,7 +275,7 @@ type manifestURL struct {
 
 func (a *App) indexHandler(c *fiber.Ctx) error {
 	// This matches the Python API's repo link
-	return c.JSON(fiber.Map{"HIFI-API": "v1.0", "Repo": "https://github.com/sachinsenal0x64/hifi"})
+	return c.JSON(fiber.Map{"HIFI-Go": "v2.0.1", "Repo": "https://github.com/eduardprigoana/hifi-go"})
 }
 
 func (a *App) dashHandler(c *fiber.Ctx) error {
