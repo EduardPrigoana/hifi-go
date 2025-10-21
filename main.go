@@ -270,7 +270,7 @@ type manifestURL struct {
 }
 
 func (a *App) indexHandler(c *fiber.Ctx) error {
-	return c.JSON(fiber.Map{"HIFI-API": "v1.0", "Repo": "https://github.com/sachinsenal0x64/hifi"})
+	return c.JSON(fiber.Map{"HIFI-API": "v2.0", "Repo": "https://github.com/eduardprigoana/hifi-go"})
 }
 
 func (a *App) dashHandler(c *fiber.Ctx) error {
