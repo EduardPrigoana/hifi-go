@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/base64"
+	"encoding/json" // Import the standard library's json for RawMessage
 	"fmt"
 	"log"
 	"net/url"
@@ -97,12 +98,12 @@ func newApp() *App {
 	})
 
 	pingCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
 	if err := redisClient.Ping(pingCtx).Err(); err != nil {
 		log.Printf("Redis connection failed: %v", err)
 	} else {
 		log.Println("Redis connected successfully")
 	}
-	cancel()
 
 	httpClient := &fasthttp.Client{
 		MaxConnsPerHost: maxConnsPerHost, MaxIdleConnDuration: maxIdleConnDuration, ReadTimeout: requestTimeout, WriteTimeout: requestTimeout, MaxResponseBodySize: maxResponseBodySize,
@@ -243,6 +244,7 @@ func (a *App) makeRequest(reqURL, token string) ([]byte, int, error) {
 		return nil, 0, err
 	}
 
+	// We need to copy the body because the response will be released.
 	body := append([]byte(nil), resp.Body()...)
 	return body, resp.StatusCode(), nil
 }
@@ -272,7 +274,8 @@ type manifestURL struct {
 }
 
 func (a *App) indexHandler(c *fiber.Ctx) error {
-	return c.JSON(fiber.Map{"HIFI-API": "v2.0", "Repo": "https://github.com/eduardprigoana/hifi-go"})
+	// This matches the Python API's repo link
+	return c.JSON(fiber.Map{"HIFI-API": "v1.0", "Repo": "https://github.com/sachinsenal0x64/hifi"})
 }
 
 func (a *App) dashHandler(c *fiber.Ctx) error {
@@ -328,6 +331,7 @@ func (a *App) trackHandler(c *fiber.Ctx) error {
 	var wg sync.WaitGroup
 	var infoData, trackData []byte
 	var infoErr, trackErr error
+	var infoStatusCode, trackStatusCode int
 	wg.Add(2)
 
 	go func() {
@@ -336,7 +340,7 @@ func (a *App) trackHandler(c *fiber.Ctx) error {
 		sb.WriteString("https://api.tidal.com/v1/tracks/")
 		sb.WriteString(id)
 		sb.WriteString("/?countryCode=US")
-		infoData, _, infoErr = a.makeRequest(sb.String(), token)
+		infoData, infoStatusCode, infoErr = a.makeRequest(sb.String(), token)
 	}()
 	go func() {
 		defer wg.Done()
@@ -346,19 +350,19 @@ func (a *App) trackHandler(c *fiber.Ctx) error {
 		sb.WriteString("/playbackinfopostpaywall/v4?audioquality=")
 		sb.WriteString(quality)
 		sb.WriteString("&playbackmode=STREAM&assetpresentation=FULL")
-		trackData, _, trackErr = a.makeRequest(sb.String(), token)
+		trackData, trackStatusCode, trackErr = a.makeRequest(sb.String(), token)
 	}()
 	wg.Wait()
 
-	if infoErr != nil || trackErr != nil {
+	if infoErr != nil || trackErr != nil || infoStatusCode != fasthttp.StatusOK || trackStatusCode != fasthttp.StatusOK {
 		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "track not found or quality unavailable"})
 	}
 
-	var infoResult, trackResult map[string]interface{}
+	// To extract the audio URL, we must parse the trackData, but we won't re-serialize it.
 	var pbm playbackInfoManifest
-	fastJSON.Unmarshal(infoData, &infoResult)
-	fastJSON.Unmarshal(trackData, &trackResult)
-	fastJSON.Unmarshal(trackData, &pbm)
+	if err := fastJSON.Unmarshal(trackData, &pbm); err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to parse manifest"})
+	}
 
 	decoded, _ := base64.StdEncoding.DecodeString(pbm.Manifest)
 	var mu manifestURL
@@ -368,7 +372,13 @@ func (a *App) trackHandler(c *fiber.Ctx) error {
 		audioURL = mu.URLs[0]
 	}
 
-	return c.JSON([]interface{}{infoResult, trackResult, fiber.Map{"OriginalTrackUrl": audioURL}})
+	// Use json.RawMessage to embed the original JSON strings without re-parsing/re-ordering.
+	// This is the key to matching the Python output.
+	return c.JSON([]interface{}{
+		json.RawMessage(infoData),
+		json.RawMessage(trackData),
+		fiber.Map{"OriginalTrackUrl": audioURL},
+	})
 }
 
 func (a *App) lyricsHandler(c *fiber.Ctx) error {
@@ -386,9 +396,11 @@ func (a *App) lyricsHandler(c *fiber.Ctx) error {
 	if err != nil || statusCode != fasthttp.StatusOK {
 		return c.Status(statusCode).JSON(fiber.Map{"error": "failed to fetch lyrics"})
 	}
-	var result map[string]interface{}
-	fastJSON.Unmarshal(data, &result)
-	return c.JSON([]interface{}{result})
+
+	// Wrap the raw data in an array to match the Python API's `[search_data.json()]`
+	return c.JSON([]interface{}{
+		json.RawMessage(data),
+	})
 }
 
 func (a *App) songHandler(c *fiber.Ctx) error {
@@ -411,30 +423,38 @@ func (a *App) songHandler(c *fiber.Ctx) error {
 		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "search failed"})
 	}
 
+	// We have to parse the search data to get the ID for the next request.
+	// We'll use a struct that captures the first item as a raw message.
 	var searchResult struct {
-		Items []map[string]interface{} `json:"items"`
+		Items []json.RawMessage `json:"items"`
 	}
 	if err := fastJSON.Unmarshal(searchData, &searchResult); err != nil || len(searchResult.Items) == 0 {
 		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "no results found"})
 	}
 
 	firstItem := searchResult.Items[0]
-	trackID, ok := firstItem["id"].(float64)
-	if !ok {
+
+	// To get the ID, we unmarshal just the first item into a temporary struct.
+	var idExtractor struct {
+		ID float64 `json:"id"`
+	}
+	if err := fastJSON.Unmarshal(firstItem, &idExtractor); err != nil {
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "invalid track ID in search result"})
 	}
 
 	sb.Reset()
 	sb.WriteString("https://api.tidal.com/v1/tracks/")
-	sb.WriteString(fmt.Sprintf("%.0f", trackID))
+	sb.WriteString(fmt.Sprintf("%.0f", idExtractor.ID))
 	sb.WriteString("/playbackinfopostpaywall/v4?audioquality=")
 	sb.WriteString(c.Query("quality", "LOSSLESS"))
 	sb.WriteString("&playbackmode=STREAM&assetpresentation=FULL")
 
-	trackData, _, _ := a.makeRequest(sb.String(), token)
-	var trackResult map[string]interface{}
+	trackData, trackStatusCode, err := a.makeRequest(sb.String(), token)
+	if err != nil || trackStatusCode != fasthttp.StatusOK {
+		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "playback info not found"})
+	}
+
 	var pbm playbackInfoManifest
-	fastJSON.Unmarshal(trackData, &trackResult)
 	fastJSON.Unmarshal(trackData, &pbm)
 	decoded, _ := base64.StdEncoding.DecodeString(pbm.Manifest)
 
@@ -445,7 +465,12 @@ func (a *App) songHandler(c *fiber.Ctx) error {
 		audioURL = mu.URLs[0]
 	}
 
-	return c.JSON([]interface{}{firstItem, trackResult, fiber.Map{"OriginalTrackUrl": audioURL}})
+	// Assemble the final response using RawMessage to preserve the original JSON.
+	return c.JSON([]interface{}{
+		json.RawMessage(firstItem),
+		json.RawMessage(trackData),
+		fiber.Map{"OriginalTrackUrl": audioURL},
+	})
 }
 
 func (a *App) searchHandler(c *fiber.Ctx) error {
@@ -455,7 +480,7 @@ func (a *App) searchHandler(c *fiber.Ctx) error {
 	}
 
 	var sb strings.Builder
-	var isArtistSearch bool
+	var wrapInArray bool
 	switch {
 	case c.Query("s") != "":
 		sb.WriteString("https://api.tidal.com/v1/search/tracks?query=")
@@ -464,7 +489,7 @@ func (a *App) searchHandler(c *fiber.Ctx) error {
 		sb.WriteString("https://api.tidal.com/v1/search/top-hits?query=")
 		sb.WriteString(url.QueryEscape(c.Query("a")))
 		sb.WriteString("&types=ARTISTS,TRACKS")
-		isArtistSearch = true
+		wrapInArray = true // Python API wraps artist search in an array
 	case c.Query("al") != "":
 		sb.WriteString("https://api.tidal.com/v1/search/top-hits?query=")
 		sb.WriteString(url.QueryEscape(c.Query("al")))
@@ -473,7 +498,7 @@ func (a *App) searchHandler(c *fiber.Ctx) error {
 		sb.WriteString("https://api.tidal.com/v1/search/top-hits?query=")
 		sb.WriteString(url.QueryEscape(c.Query("v")))
 		sb.WriteString("&types=VIDEOS")
-	case c.Query("p") != "":
+	case cQuery("p") != "":
 		sb.WriteString("https://api.tidal.com/v1/search/top-hits?query=")
 		sb.WriteString(url.QueryEscape(c.Query("p")))
 		sb.WriteString("&types=PLAYLISTS")
@@ -482,17 +507,19 @@ func (a *App) searchHandler(c *fiber.Ctx) error {
 	}
 	fmt.Fprintf(&sb, "&limit=%d&offset=%d&countryCode=US", c.QueryInt("li", 25), c.QueryInt("o", 0))
 
-	data, _, err := a.makeRequest(sb.String(), token)
-	if err != nil {
+	data, statusCode, err := a.makeRequest(sb.String(), token)
+	if err != nil || statusCode != fasthttp.StatusOK {
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "search failed"})
 	}
 
-	var result map[string]interface{}
-	fastJSON.Unmarshal(data, &result)
-	if isArtistSearch {
-		return c.JSON([]interface{}{result})
+	// Conditionally wrap response in array to match Python API
+	if wrapInArray {
+		return c.JSON([]interface{}{json.RawMessage(data)})
 	}
-	return c.JSON(result)
+
+	// Otherwise, send the raw JSON object
+	c.Set(fiber.HeaderContentType, fiber.MIMEApplicationJSON)
+	return c.Send(data)
 }
 
 func (a *App) albumHandler(c *fiber.Ctx) error {
@@ -508,6 +535,7 @@ func (a *App) albumHandler(c *fiber.Ctx) error {
 	var wg sync.WaitGroup
 	var albumData, itemsData []byte
 	var albumErr, itemsErr error
+	var albumStatusCode, itemsStatusCode int
 	wg.Add(2)
 
 	go func() {
@@ -516,7 +544,7 @@ func (a *App) albumHandler(c *fiber.Ctx) error {
 		sb.WriteString("https://api.tidal.com/v1/albums/")
 		sb.WriteString(id)
 		sb.WriteString("/?countryCode=US")
-		albumData, _, albumErr = a.makeRequest(sb.String(), token)
+		albumData, albumStatusCode, albumErr = a.makeRequest(sb.String(), token)
 	}()
 	go func() {
 		defer wg.Done()
@@ -524,19 +552,18 @@ func (a *App) albumHandler(c *fiber.Ctx) error {
 		sb.WriteString("https://api.tidal.com/v1/albums/")
 		sb.WriteString(id)
 		sb.WriteString("/items?limit=100&countryCode=US")
-		itemsData, _, itemsErr = a.makeRequest(sb.String(), token)
+		itemsData, itemsStatusCode, itemsErr = a.makeRequest(sb.String(), token)
 	}()
 	wg.Wait()
 
-	if albumErr != nil || itemsErr != nil {
+	if albumErr != nil || itemsErr != nil || albumStatusCode != fasthttp.StatusOK || itemsStatusCode != fasthttp.StatusOK {
 		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "album or items not found"})
 	}
 
-	var albumResult, itemsResult map[string]interface{}
-	fastJSON.Unmarshal(albumData, &albumResult)
-	fastJSON.Unmarshal(itemsData, &itemsResult)
-
-	return c.JSON([]interface{}{albumResult, itemsResult})
+	return c.JSON([]interface{}{
+		json.RawMessage(albumData),
+		json.RawMessage(itemsData),
+	})
 }
 
 func (a *App) playlistHandler(c *fiber.Ctx) error {
@@ -552,6 +579,7 @@ func (a *App) playlistHandler(c *fiber.Ctx) error {
 	var wg sync.WaitGroup
 	var playlistData, itemsData []byte
 	var playlistErr, itemsErr error
+	var playlistStatusCode, itemsStatusCode int
 	wg.Add(2)
 
 	go func() {
@@ -560,7 +588,7 @@ func (a *App) playlistHandler(c *fiber.Ctx) error {
 		sb.WriteString("https://api.tidal.com/v1/playlists/")
 		sb.WriteString(id)
 		sb.WriteString("?countryCode=US")
-		playlistData, _, playlistErr = a.makeRequest(sb.String(), token)
+		playlistData, playlistStatusCode, playlistErr = a.makeRequest(sb.String(), token)
 	}()
 	go func() {
 		defer wg.Done()
@@ -568,20 +596,21 @@ func (a *App) playlistHandler(c *fiber.Ctx) error {
 		sb.WriteString("https://api.tidal.com/v1/playlists/")
 		sb.WriteString(id)
 		sb.WriteString("/items?countryCode=US&limit=100")
-		itemsData, _, itemsErr = a.makeRequest(sb.String(), token)
+		itemsData, itemsStatusCode, itemsErr = a.makeRequest(sb.String(), token)
 	}()
 	wg.Wait()
 
-	if playlistErr != nil || itemsErr != nil {
+	if playlistErr != nil || itemsErr != nil || playlistStatusCode != fasthttp.StatusOK || itemsStatusCode != fasthttp.StatusOK {
 		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "playlist or items not found"})
 	}
 
-	var playlistResult, itemsResult map[string]interface{}
-	fastJSON.Unmarshal(playlistData, &playlistResult)
-	fastJSON.Unmarshal(itemsData, &itemsResult)
-	return c.JSON([]interface{}{playlistResult, itemsResult})
+	return c.JSON([]interface{}{
+		json.RawMessage(playlistData),
+		json.RawMessage(itemsData),
+	})
 }
 
+// Structs for artist handler, these are complex and need parsing
 type artistPageAlbums struct {
 	Rows []struct {
 		Modules []struct {
@@ -599,7 +628,7 @@ type albumPageTracks struct {
 		Modules []struct {
 			PagedList struct {
 				Items []struct {
-					Item interface{} `json:"item"`
+					Item json.RawMessage `json:"item"` // Use RawMessage to preserve track structure
 				} `json:"items"`
 			} `json:"pagedList"`
 		} `json:"modules"`
@@ -607,7 +636,7 @@ type albumPageTracks struct {
 }
 
 func (a *App) artistHandler(c *fiber.Ctx) error {
-	id, f := c.Query("id"), c.Query("f")
+	id, f := c.Query("id"), cQuery("f")
 	if id == "" && f == "" {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "id or f parameter required"})
 	}
@@ -622,25 +651,29 @@ func (a *App) artistHandler(c *fiber.Ctx) error {
 		sb.WriteString(id)
 		sb.WriteString("?countryCode=US")
 		data, statusCode, err := a.makeRequest(sb.String(), token)
+
+		// Fallback for pages/artist endpoint
 		if err != nil || statusCode == fasthttp.StatusNotFound {
 			sb.Reset()
 			sb.WriteString("https://api.tidal.com/v1/pages/artist?artistId=")
 			sb.WriteString(id)
 			sb.WriteString("&countryCode=US&locale=en_US&deviceType=BROWSER")
-			data, _, _ := a.makeRequest(sb.String(), token)
-			var result map[string]interface{}
-			fastJSON.Unmarshal(data, &result)
-			return c.JSON([]interface{}{result})
+			pageData, pageStatusCode, pageErr := a.makeRequest(sb.String(), token)
+			if pageErr != nil || pageStatusCode != fasthttp.StatusOK {
+				return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "artist not found"})
+			}
+			// Python API wraps this in an array
+			return c.JSON([]interface{}{json.RawMessage(pageData)})
 		}
 
+		// This part constructs new JSON, so it's a transformation, not a proxy.
+		// We'll parse what we need and return the original data alongside the new data.
 		var artistResult struct {
 			ID      float64 `json:"id"`
 			Name    string  `json:"name"`
 			Picture string  `json:"picture"`
 		}
-		var fullResult map[string]interface{}
 		fastJSON.Unmarshal(data, &artistResult)
-		fastJSON.Unmarshal(data, &fullResult)
 
 		sb.Reset()
 		sb.WriteString("https://resources.tidal.com/images/")
@@ -648,28 +681,28 @@ func (a *App) artistHandler(c *fiber.Ctx) error {
 		basePath := sb.String()
 
 		jsonData := []fiber.Map{{"id": int(artistResult.ID), "name": artistResult.Name, "750": basePath + "/750x750.jpg"}}
-		return c.JSON([]interface{}{fullResult, jsonData})
+		return c.JSON([]interface{}{json.RawMessage(data), jsonData})
 	}
 
 	if f != "" {
 		sb.WriteString("https://api.tidal.com/v1/pages/single-module-page/ae223310-a4c2-4568-a770-ffef70344441/4/a4f964ba-b52e-41e8-b25c-06cd70c1efad/2?artistId=")
 		sb.WriteString(f)
 		sb.WriteString("&countryCode=US&deviceType=BROWSER")
-		albumData, _, err := a.makeRequest(sb.String(), token)
-		if err != nil {
+		albumData, statusCode, err := a.makeRequest(sb.String(), token)
+		if err != nil || statusCode != fasthttp.StatusOK {
 			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to fetch artist albums"})
 		}
 
-		var albumsResult map[string]interface{}
 		var albumsParsed artistPageAlbums
-		fastJSON.Unmarshal(albumData, &albumsResult)
 		fastJSON.Unmarshal(albumData, &albumsParsed)
 
 		if len(albumsParsed.Rows) == 0 || len(albumsParsed.Rows[0].Modules) == 0 {
-			return c.JSON([]interface{}{albumsResult})
+			// If no albums found, just return the album data wrapped in an array, like Python.
+			return c.JSON([]interface{}{json.RawMessage(albumData)})
 		}
+
 		albumItems := albumsParsed.Rows[0].Modules[0].PagedList.Items
-		allTracksSlices := make([][]interface{}, len(albumItems))
+		allTracksSlices := make([][]json.RawMessage, len(albumItems))
 		var wg sync.WaitGroup
 
 		for i, item := range albumItems {
@@ -687,9 +720,9 @@ func (a *App) artistHandler(c *fiber.Ctx) error {
 
 				if len(albumInfoParsed.Rows) > 1 && len(albumInfoParsed.Rows[1].Modules) > 0 {
 					trackItems := albumInfoParsed.Rows[1].Modules[0].PagedList.Items
-					tracks := make([]interface{}, len(trackItems))
+					tracks := make([]json.RawMessage, len(trackItems))
 					for j, trackItem := range trackItems {
-						tracks[j] = trackItem.Item
+						tracks[j] = trackItem.Item // Item is already a RawMessage
 					}
 					allTracksSlices[idx] = tracks
 				}
@@ -701,16 +734,18 @@ func (a *App) artistHandler(c *fiber.Ctx) error {
 		for _, s := range allTracksSlices {
 			totalTracks += len(s)
 		}
-		allTracks := make([]interface{}, 0, totalTracks)
+		allTracks := make([]json.RawMessage, 0, totalTracks)
 		for _, s := range allTracksSlices {
 			allTracks = append(allTracks, s...)
 		}
-		return c.JSON([]interface{}{albumsResult, allTracks})
+		return c.JSON([]interface{}{json.RawMessage(albumData), allTracks})
 	}
 	return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid parameters"})
 }
 
 func (a *App) coverHandler(c *fiber.Ctx) error {
+	// This handler is a data transformer, not a proxy. It creates new JSON.
+	// The original implementation is correct for its purpose and matches the Python output.
 	id, q := c.Query("id"), c.Query("q")
 	if id == "" && q == "" {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "id or q parameter required"})
@@ -789,13 +824,12 @@ func (a *App) homeHandler(c *fiber.Ctx) error {
 	sb.WriteString("https://api.tidal.com/v1/pages/home?countryCode=")
 	sb.WriteString(strings.ToUpper(c.Query("country", "US")))
 	sb.WriteString("&deviceType=BROWSER")
-	data, _, err := a.makeRequest(sb.String(), token)
-	if err != nil {
+	data, statusCode, err := a.makeRequest(sb.String(), token)
+	if err != nil || statusCode != fasthttp.StatusOK {
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to fetch home"})
 	}
-	var result map[string]interface{}
-	fastJSON.Unmarshal(data, &result)
-	return c.JSON(result)
+	c.Set(fiber.HeaderContentType, fiber.MIMEApplicationJSON)
+	return c.Send(data)
 }
 
 func (a *App) mixHandler(c *fiber.Ctx) error {
@@ -810,13 +844,12 @@ func (a *App) mixHandler(c *fiber.Ctx) error {
 	sb.WriteString(strings.ToUpper(c.Query("country", "US")))
 
 	headers := map[string]string{"x-tidal-token": a.config.ClientID}
-	data, _, err := a.makeRequestWithHeader(sb.String(), headers)
-	if err != nil {
+	data, statusCode, err := a.makeRequestWithHeader(sb.String(), headers)
+	if err != nil || statusCode != fasthttp.StatusOK {
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "request failed"})
 	}
-	var result map[string]interface{}
-	fastJSON.Unmarshal(data, &result)
-	return c.JSON(result)
+	c.Set(fiberHeaderContentType, fiber.MIMEApplicationJSON)
+	return c.Send(data)
 }
 
 func main() {
