@@ -3,7 +3,7 @@ package main
 import (
 	"context"
 	"encoding/base64"
-	"encoding/json" // Import the standard library's json for RawMessage
+	"encoding/json"
 	"fmt"
 	"log"
 	"net/url"
@@ -21,31 +21,25 @@ import (
 	"github.com/gofiber/fiber/v2/middleware/recover"
 	"github.com/joho/godotenv"
 	jsoniter "github.com/json-iterator/go"
-	"github.com/redis/go-redis/v9"
 	"github.com/valyala/fasthttp"
 )
 
 var fastJSON = jsoniter.ConfigCompatibleWithStandardLibrary
 
 const (
-	tokenCacheDuration  = 23 * time.Hour
-	tokenCheckInterval  = 30 * time.Minute
 	requestTimeout      = 15 * time.Second
 	maxConnsPerHost     = 2000
 	maxIdleConnDuration = 90 * time.Second
 	maxResponseBodySize = 100 * 1024 * 1024
-	redisPoolSize       = 50
 )
 
 type Config struct {
-	ClientID, ClientIDHires, ClientSecret, ClientSecretHires, RefreshToken, RefreshTokenHires, RedisURL, RedisPort, RedisPassword, UserID, Port string
+	ClientID, ClientIDHires, ClientSecret, ClientSecretHires, RefreshToken, RefreshTokenHires, UserID, Port string
 }
 
 type TokenCache struct {
-	Token     string
-	ExpiresAt time.Time
-	LastCheck time.Time
-	mu        sync.RWMutex
+	Token string
+	mu    sync.RWMutex
 }
 
 type TokenResponse struct {
@@ -57,7 +51,6 @@ type TokenResponse struct {
 
 type App struct {
 	config        *Config
-	redisClient   *redis.Client
 	httpClient    *fasthttp.Client
 	tokenCache    *TokenCache
 	tokenCacheHR  *TokenCache
@@ -76,9 +69,6 @@ func loadConfig() *Config {
 		ClientSecretHires: os.Getenv("CLIENT_SECRET_HIRES"),
 		RefreshToken:      os.Getenv("TIDAL_REFRESH"),
 		RefreshTokenHires: os.Getenv("TIDAL_REFRESH_HIRES"),
-		RedisURL:          getEnv("REDIS_URL", "localhost"),
-		RedisPort:         getEnv("REDIS_PORT", "6379"),
-		RedisPassword:     os.Getenv("REDIS_PASSWORD"),
 		UserID:            os.Getenv("USER_ID"),
 		Port:              getEnv("PORT", "8000"),
 	}
@@ -93,97 +83,25 @@ func getEnv(key, defaultValue string) string {
 
 func newApp() *App {
 	config := loadConfig()
-	redisClient := redis.NewClient(&redis.Options{
-		Addr: config.RedisURL + ":" + config.RedisPort, Password: config.RedisPassword, DB: 0, PoolSize: redisPoolSize, MinIdleConns: 10,
-	})
-
-	pingCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-	defer cancel()
-	if err := redisClient.Ping(pingCtx).Err(); err != nil {
-		log.Printf("Redis connection failed: %v", err)
-	} else {
-		log.Println("Redis connected successfully")
-	}
 
 	httpClient := &fasthttp.Client{
-		MaxConnsPerHost: maxConnsPerHost, MaxIdleConnDuration: maxIdleConnDuration, ReadTimeout: requestTimeout, WriteTimeout: requestTimeout, MaxResponseBodySize: maxResponseBodySize,
+		MaxConnsPerHost:     maxConnsPerHost,
+		MaxIdleConnDuration: maxIdleConnDuration,
+		ReadTimeout:         requestTimeout,
+		WriteTimeout:        requestTimeout,
+		MaxResponseBodySize: maxResponseBodySize,
 	}
 	app := &App{
 		config:       config,
-		redisClient:  redisClient,
 		httpClient:   httpClient,
 		tokenCache:   &TokenCache{},
 		tokenCacheHR: &TokenCache{},
 	}
 
-	go func() {
-		if _, err := app.getToken(false); err != nil {
-			log.Printf("Failed to pre-warm standard token: %v", err)
-		}
-		if _, err := app.getToken(true); err != nil {
-			log.Printf("Failed to pre-warm HiRes token: %v", err)
-		}
-	}()
-
 	return app
 }
 
-func (a *App) getToken(hiRes bool) (string, error) {
-	cache, lock, cacheKey := a.tokenCache, &a.refreshLock, "access_token"
-	if hiRes {
-		cache, lock, cacheKey = a.tokenCacheHR, &a.refreshLockHR, "access_token_hires"
-	}
-
-	cache.mu.RLock()
-	if cache.Token != "" && time.Now().Before(cache.ExpiresAt) {
-		token := cache.Token
-		cache.mu.RUnlock()
-		return token, nil
-	}
-	cache.mu.RUnlock()
-
-	lock.Lock()
-	defer lock.Unlock()
-
-	cache.mu.RLock()
-	if cache.Token != "" && time.Now().Before(cache.ExpiresAt) {
-		token := cache.Token
-		cache.mu.RUnlock()
-		return token, nil
-	}
-	cache.mu.RUnlock()
-
-	if token, err := a.redisClient.Get(ctx, cacheKey).Result(); err == nil && token != "" {
-		if time.Since(cache.LastCheck) <= tokenCheckInterval || a.quickTokenCheck(token) {
-			cache.mu.Lock()
-			cache.Token, cache.ExpiresAt, cache.LastCheck = token, time.Now().Add(tokenCacheDuration), time.Now()
-			cache.mu.Unlock()
-			return token, nil
-		}
-	}
-
-	token, expiresIn, err := a.refreshToken(hiRes)
-	if err != nil {
-		return "", fmt.Errorf("token refresh failed: %w", err)
-	}
-
-	expiryDuration := time.Duration(expiresIn) * time.Second
-	if expiryDuration > tokenCacheDuration {
-		expiryDuration = tokenCacheDuration
-	}
-	if expiryDuration <= 0 {
-		expiryDuration = time.Hour
-	}
-
-	cache.mu.Lock()
-	cache.Token, cache.ExpiresAt, cache.LastCheck = token, time.Now().Add(expiryDuration), time.Now()
-	cache.mu.Unlock()
-
-	a.redisClient.Set(ctx, cacheKey, token, expiryDuration)
-	return token, nil
-}
-
-func (a *App) quickTokenCheck(token string) bool {
+func (a *App) tokenCheck(token string) bool {
 	req, resp := fasthttp.AcquireRequest(), fasthttp.AcquireResponse()
 	defer func() { fasthttp.ReleaseRequest(req); fasthttp.ReleaseResponse(resp) }()
 
@@ -194,7 +112,63 @@ func (a *App) quickTokenCheck(token string) bool {
 	req.SetRequestURI(sb.String())
 	req.Header.Set("Authorization", "Bearer "+token)
 
-	return a.httpClient.DoTimeout(req, resp, 5*time.Second) == nil && resp.StatusCode() == fasthttp.StatusOK
+	err := a.httpClient.DoTimeout(req, resp, 5*time.Second)
+	statusCode := resp.StatusCode()
+
+	log.Printf("Tidal API status: %d", statusCode)
+
+	return err == nil && statusCode == fasthttp.StatusOK
+}
+
+func (a *App) getToken(hiRes bool) (string, error) {
+	cache, lock := a.tokenCache, &a.refreshLock
+	if hiRes {
+		cache, lock = a.tokenCacheHR, &a.refreshLockHR
+	}
+
+	cache.mu.RLock()
+	cachedToken := cache.Token
+	cache.mu.RUnlock()
+
+	if cachedToken != "" {
+		log.Println("🔍 Found cached token. Checking validity...")
+		if a.tokenCheck(cachedToken) {
+			log.Println("✅ Using cached token")
+			return cachedToken, nil
+		}
+		log.Println("⚠️ Cached token invalid or expired — refreshing...")
+		cache.mu.Lock()
+		cache.Token = ""
+		cache.mu.Unlock()
+	}
+
+	lock.Lock()
+	defer lock.Unlock()
+
+	cache.mu.RLock()
+	cachedToken = cache.Token
+	cache.mu.RUnlock()
+
+	if cachedToken != "" {
+		log.Println("🔍 Found cached token. Checking validity...")
+		if a.tokenCheck(cachedToken) {
+			log.Println("✅ Using cached token")
+			return cachedToken, nil
+		}
+		log.Println("⚠️ Cached token invalid or expired — refreshing...")
+	}
+
+	token, _, err := a.refreshToken(hiRes)
+	if err != nil {
+		return "", fmt.Errorf("token refresh failed: %w", err)
+	}
+
+	cache.mu.Lock()
+	cache.Token = token
+	cache.mu.Unlock()
+
+	log.Println("🔄 Token refreshed and cached.")
+	return token, nil
 }
 
 func (a *App) refreshToken(hiRes bool) (string, int, error) {
@@ -244,7 +218,6 @@ func (a *App) makeRequest(reqURL, token string) ([]byte, int, error) {
 		return nil, 0, err
 	}
 
-	// We need to copy the body because the response will be released.
 	body := append([]byte(nil), resp.Body()...)
 	return body, resp.StatusCode(), nil
 }
@@ -274,8 +247,7 @@ type manifestURL struct {
 }
 
 func (a *App) indexHandler(c *fiber.Ctx) error {
-	// This matches the Python API's repo link
-	return c.JSON(fiber.Map{"HIFI-Go": "v2.0.1", "Repo": "https://github.com/eduardprigoana/hifi-go"})
+	return c.JSON(fiber.Map{"HIFI-API": "v1.0", "Repo": "https://github.com/sachinsenal0x64/hifi"})
 }
 
 func (a *App) dashHandler(c *fiber.Ctx) error {
@@ -358,7 +330,6 @@ func (a *App) trackHandler(c *fiber.Ctx) error {
 		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "track not found or quality unavailable"})
 	}
 
-	// To extract the audio URL, we must parse the trackData, but we won't re-serialize it.
 	var pbm playbackInfoManifest
 	if err := fastJSON.Unmarshal(trackData, &pbm); err != nil {
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to parse manifest"})
@@ -372,8 +343,6 @@ func (a *App) trackHandler(c *fiber.Ctx) error {
 		audioURL = mu.URLs[0]
 	}
 
-	// Use json.RawMessage to embed the original JSON strings without re-parsing/re-ordering.
-	// This is the key to matching the Python output.
 	return c.JSON([]interface{}{
 		json.RawMessage(infoData),
 		json.RawMessage(trackData),
@@ -397,7 +366,6 @@ func (a *App) lyricsHandler(c *fiber.Ctx) error {
 		return c.Status(statusCode).JSON(fiber.Map{"error": "failed to fetch lyrics"})
 	}
 
-	// Wrap the raw data in an array to match the Python API's `[search_data.json()]`
 	return c.JSON([]interface{}{
 		json.RawMessage(data),
 	})
@@ -423,8 +391,6 @@ func (a *App) songHandler(c *fiber.Ctx) error {
 		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "search failed"})
 	}
 
-	// We have to parse the search data to get the ID for the next request.
-	// We'll use a struct that captures the first item as a raw message.
 	var searchResult struct {
 		Items []json.RawMessage `json:"items"`
 	}
@@ -434,7 +400,6 @@ func (a *App) songHandler(c *fiber.Ctx) error {
 
 	firstItem := searchResult.Items[0]
 
-	// To get the ID, we unmarshal just the first item into a temporary struct.
 	var idExtractor struct {
 		ID float64 `json:"id"`
 	}
@@ -465,7 +430,6 @@ func (a *App) songHandler(c *fiber.Ctx) error {
 		audioURL = mu.URLs[0]
 	}
 
-	// Assemble the final response using RawMessage to preserve the original JSON.
 	return c.JSON([]interface{}{
 		json.RawMessage(firstItem),
 		json.RawMessage(trackData),
@@ -489,7 +453,7 @@ func (a *App) searchHandler(c *fiber.Ctx) error {
 		sb.WriteString("https://api.tidal.com/v1/search/top-hits?query=")
 		sb.WriteString(url.QueryEscape(c.Query("a")))
 		sb.WriteString("&types=ARTISTS,TRACKS")
-		wrapInArray = true // Python API wraps artist search in an array
+		wrapInArray = true
 	case c.Query("al") != "":
 		sb.WriteString("https://api.tidal.com/v1/search/top-hits?query=")
 		sb.WriteString(url.QueryEscape(c.Query("al")))
@@ -498,7 +462,7 @@ func (a *App) searchHandler(c *fiber.Ctx) error {
 		sb.WriteString("https://api.tidal.com/v1/search/top-hits?query=")
 		sb.WriteString(url.QueryEscape(c.Query("v")))
 		sb.WriteString("&types=VIDEOS")
-	case c.Query("p") != "": // <-- FIX: Was cQuery("p")
+	case c.Query("p") != "":
 		sb.WriteString("https://api.tidal.com/v1/search/top-hits?query=")
 		sb.WriteString(url.QueryEscape(c.Query("p")))
 		sb.WriteString("&types=PLAYLISTS")
@@ -512,12 +476,10 @@ func (a *App) searchHandler(c *fiber.Ctx) error {
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "search failed"})
 	}
 
-	// Conditionally wrap response in array to match Python API
 	if wrapInArray {
 		return c.JSON([]interface{}{json.RawMessage(data)})
 	}
 
-	// Otherwise, send the raw JSON object
 	c.Set(fiber.HeaderContentType, fiber.MIMEApplicationJSON)
 	return c.Send(data)
 }
@@ -610,7 +572,6 @@ func (a *App) playlistHandler(c *fiber.Ctx) error {
 	})
 }
 
-// Structs for artist handler, these are complex and need parsing
 type artistPageAlbums struct {
 	Rows []struct {
 		Modules []struct {
@@ -628,7 +589,7 @@ type albumPageTracks struct {
 		Modules []struct {
 			PagedList struct {
 				Items []struct {
-					Item json.RawMessage `json:"item"` // Use RawMessage to preserve track structure
+					Item json.RawMessage `json:"item"`
 				} `json:"items"`
 			} `json:"pagedList"`
 		} `json:"modules"`
@@ -636,7 +597,7 @@ type albumPageTracks struct {
 }
 
 func (a *App) artistHandler(c *fiber.Ctx) error {
-	id, f := c.Query("id"), c.Query("f") // <-- FIX: Was cQuery("f")
+	id, f := c.Query("id"), c.Query("f")
 	if id == "" && f == "" {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "id or f parameter required"})
 	}
@@ -652,7 +613,6 @@ func (a *App) artistHandler(c *fiber.Ctx) error {
 		sb.WriteString("?countryCode=US")
 		data, statusCode, err := a.makeRequest(sb.String(), token)
 
-		// Fallback for pages/artist endpoint
 		if err != nil || statusCode == fasthttp.StatusNotFound {
 			sb.Reset()
 			sb.WriteString("https://api.tidal.com/v1/pages/artist?artistId=")
@@ -662,12 +622,9 @@ func (a *App) artistHandler(c *fiber.Ctx) error {
 			if pageErr != nil || pageStatusCode != fasthttp.StatusOK {
 				return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "artist not found"})
 			}
-			// Python API wraps this in an array
 			return c.JSON([]interface{}{json.RawMessage(pageData)})
 		}
 
-		// This part constructs new JSON, so it's a transformation, not a proxy.
-		// We'll parse what we need and return the original data alongside the new data.
 		var artistResult struct {
 			ID      float64 `json:"id"`
 			Name    string  `json:"name"`
@@ -697,7 +654,6 @@ func (a *App) artistHandler(c *fiber.Ctx) error {
 		fastJSON.Unmarshal(albumData, &albumsParsed)
 
 		if len(albumsParsed.Rows) == 0 || len(albumsParsed.Rows[0].Modules) == 0 {
-			// If no albums found, just return the album data wrapped in an array, like Python.
 			return c.JSON([]interface{}{json.RawMessage(albumData)})
 		}
 
@@ -722,7 +678,7 @@ func (a *App) artistHandler(c *fiber.Ctx) error {
 					trackItems := albumInfoParsed.Rows[1].Modules[0].PagedList.Items
 					tracks := make([]json.RawMessage, len(trackItems))
 					for j, trackItem := range trackItems {
-						tracks[j] = trackItem.Item // Item is already a RawMessage
+						tracks[j] = trackItem.Item
 					}
 					allTracksSlices[idx] = tracks
 				}
@@ -744,8 +700,6 @@ func (a *App) artistHandler(c *fiber.Ctx) error {
 }
 
 func (a *App) coverHandler(c *fiber.Ctx) error {
-	// This handler is a data transformer, not a proxy. It creates new JSON.
-	// The original implementation is correct for its purpose and matches the Python output.
 	id, q := c.Query("id"), c.Query("q")
 	if id == "" && q == "" {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "id or q parameter required"})
@@ -848,13 +802,12 @@ func (a *App) mixHandler(c *fiber.Ctx) error {
 	if err != nil || statusCode != fasthttp.StatusOK {
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "request failed"})
 	}
-	c.Set(fiber.HeaderContentType, fiber.MIMEApplicationJSON) // <-- FIX: Was fiberHeaderContentType
+	c.Set(fiber.HeaderContentType, fiber.MIMEApplicationJSON)
 	return c.Send(data)
 }
 
 func main() {
 	app := newApp()
-	defer app.redisClient.Close()
 
 	fiberApp := fiber.New(fiber.Config{
 		Prefork:       false,
